@@ -1,0 +1,9 @@
+# Secrets and runtime state: never commit
+.env.memoryos
+runtime_config.json
+memoryos_data/
+memoryos_data.bak*/
+*.bak*
+.venv/
+__pycache__/
+*.pyc

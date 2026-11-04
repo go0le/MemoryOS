@@ -1,9 +1,39 @@
 
 import sys
 import os
+import re
 import json
 import argparse
+import threading
+from collections import OrderedDict
 from typing import Any, Dict, Optional, List
+
+
+class _StdoutGuard:
+    """
+    MCP stdio 协议要求 stdout 只能输出协议消息，但 MemoryOS 库里到处是裸 print()（加载模型、写记忆、检索…）。
+    把 sys.stdout 的写入全部转到 stderr；MCP 传输层取的是 sys.stdout.buffer，仍指向真实 stdout，不受影响。
+    """
+    def __init__(self, real):
+        self._real = real
+        self.buffer = real.buffer
+        self.encoding = getattr(real, "encoding", "utf-8")
+        self.errors = getattr(real, "errors", "strict")
+
+    def write(self, s):
+        return sys.stderr.write(s)
+
+    def flush(self):
+        sys.stderr.flush()
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        return self._real.fileno()
+
+
+sys.stdout = _StdoutGuard(sys.stdout)
 # 确保当前目录在sys.path中，以便导入memoryos模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'memoryos'))
 
@@ -22,46 +52,86 @@ except ImportError as e:
     print("请确保项目结构正确，memoryos目录应包含所有必要文件", file=sys.stderr)
     sys.exit(1)
 
-# MemoryOS实例 - 将在初始化时设置
-memoryos_instance: Optional[Memoryos] = None
+# 配置（启动时读入）与按用户隔离的 MemoryOS 实例表。
+# 每个 user_id 有独立的短/中/长期记忆、用户画像，助手侧知识也按用户分开，互相读不到。
+_config: Dict[str, Any] = {}
+_instances: "OrderedDict[str, Memoryos]" = OrderedDict()
+_instances_lock = threading.Lock()
+MAX_LOADED_USERS = int(os.environ.get("MEMORYOS_MAX_USERS", "16"))
+_USER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$")
 
-def init_memoryos(config_path: str) -> Memoryos:
-    """初始化MemoryOS实例"""
+
+def load_config(config_path: str) -> Dict[str, Any]:
+    """读取并校验配置（不创建任何用户实例）"""
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"配置文件不存在: {config_path}")
-    
+
     with open(config_path, 'r', encoding='utf-8') as f:
         config = json.load(f)
-    
-    required_fields = ['user_id', 'openai_api_key', 'data_storage_path']
+
+    required_fields = ['openai_api_key', 'data_storage_path']
     for field in required_fields:
         if field not in config:
             raise ValueError(f"配置文件缺少必需字段: {field}")
-    
-    return Memoryos(
-        user_id=config['user_id'],
-        openai_api_key=config['openai_api_key'],
-        data_storage_path=config['data_storage_path'],
-        openai_base_url=config.get('openai_base_url'),
-        assistant_id=config.get('assistant_id', 'default_assistant_profile'),
-        short_term_capacity=config.get('short_term_capacity', 10),
-        mid_term_capacity=config.get('mid_term_capacity', 2000),
-        long_term_knowledge_capacity=config.get('long_term_knowledge_capacity', 100),
-        retrieval_queue_capacity=config.get('retrieval_queue_capacity', 7),
-        mid_term_heat_threshold=config.get('mid_term_heat_threshold', 5.0),
-        llm_model=config.get('llm_model', 'gpt-4o-mini'),
-        embedding_model_name=config.get('embedding_model_name', 'all-MiniLM-L6-v2')
-    )
+    return config
+
+
+def _safe_dir_id(user_id: str) -> str:
+    """user_id 会被拼进磁盘路径，只允许字母数字和 : _ -，':' 落盘时换成 '_'"""
+    if not isinstance(user_id, str) or not _USER_ID_RE.match(user_id):
+        raise ValueError("user_id 非法：必须是 1-64 位字母/数字/冒号/下划线/连字符，且以字母或数字开头")
+    return user_id.replace(":", "_")
+
+
+def get_memoryos(user_id: str) -> Memoryos:
+    """取（必要时创建）某个用户专属的 MemoryOS 实例；超过上限时淘汰最久未用的（数据已落盘，下次再加载）"""
+    dir_id = _safe_dir_id(user_id)
+    with _instances_lock:
+        inst = _instances.get(dir_id)
+        if inst is not None:
+            _instances.move_to_end(dir_id)
+            return inst
+        config = _config
+        inst = Memoryos(
+            user_id=dir_id,
+            openai_api_key=config['openai_api_key'],
+            data_storage_path=config['data_storage_path'],
+            openai_base_url=config.get('openai_base_url'),
+            assistant_id=f"{config.get('assistant_id', 'default_assistant_profile')}_{dir_id}",
+            short_term_capacity=config.get('short_term_capacity', 10),
+            mid_term_capacity=config.get('mid_term_capacity', 2000),
+            long_term_knowledge_capacity=config.get('long_term_knowledge_capacity', 100),
+            retrieval_queue_capacity=config.get('retrieval_queue_capacity', 7),
+            mid_term_heat_threshold=config.get('mid_term_heat_threshold', 5.0),
+            llm_model=config.get('llm_model', 'gpt-4o-mini'),
+            embedding_model_name=config.get('embedding_model_name', 'all-MiniLM-L6-v2')
+        )
+        _instances[dir_id] = inst
+        while len(_instances) > MAX_LOADED_USERS:
+            _instances.popitem(last=False)
+        return inst
+
+
+def _warm_embedding_model() -> None:
+    """后台预加载嵌入模型，避免第一次调用工具时等十几秒"""
+    try:
+        from utils import get_embedding
+        name = _config.get('embedding_model_name', 'all-MiniLM-L6-v2')
+        kwargs = {'use_fp16': True} if 'bge-m3' in name.lower() else {}
+        get_embedding("warmup", model_name=name, use_cache=False, **kwargs)
+    except Exception as e:
+        print(f"嵌入模型预加载失败（首次调用时会再试）: {e}", file=sys.stderr)
 
 # 创建FastMCP服务器实例
 mcp = FastMCP("MemoryOS")
 
 @mcp.tool()
-def add_memory(user_input: str, agent_response: str, timestamp: Optional[str] = None, meta_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def add_memory(user_id: str, user_input: str, agent_response: str, timestamp: Optional[str] = None, meta_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    向MemoryOS系统添加新的记忆（用户输入和助手回应的对话对）
+    向MemoryOS系统添加新的记忆（用户输入和助手回应的对话对）。记忆按 user_id 严格隔离。
     
     Args:
+        user_id: 记忆所属用户的标识。必须原样使用消息开头 [用户标识：…] 里的值，不得自行编造或改写
         user_input: 用户的输入或问题
         agent_response: 助手的回应
         timestamp: 时间戳（可选，格式：YYYY-MM-DD HH:MM:SS）
@@ -70,15 +140,8 @@ def add_memory(user_input: str, agent_response: str, timestamp: Optional[str] = 
     Returns:
         包含操作结果的字典
     """
-    global memoryos_instance
-    
-    if memoryos_instance is None:
-        return {
-            "status": "error",
-            "message": "MemoryOS is not initialized. Please check the configuration file."
-        }
-    
     try:
+        memoryos_instance = get_memoryos(user_id)
         if not user_input or not agent_response:
             return {
                 "status": "error",
@@ -112,11 +175,12 @@ def add_memory(user_input: str, agent_response: str, timestamp: Optional[str] = 
         }
 
 @mcp.tool()
-def retrieve_memory(query: str, relationship_with_user: str = "friend", style_hint: str = "", max_results: int = 10) -> Dict[str, Any]:
+def retrieve_memory(user_id: str, query: str, relationship_with_user: str = "friend", style_hint: str = "", max_results: int = 10) -> Dict[str, Any]:
     """
-    根据查询从MemoryOS检索相关的记忆和上下文信息，包括短期记忆、中期记忆和长期知识
+    根据查询从MemoryOS检索相关的记忆和上下文信息，包括短期记忆、中期记忆和长期知识。只能检索 user_id 自己的记忆。
     
     Args:
+        user_id: 记忆所属用户的标识。必须原样使用消息开头 [用户标识：…] 里的值，不得自行编造或改写
         query: 检索查询，描述要寻找的信息
         relationship_with_user: 与用户的关系类型（如：friend, assistant, colleague等）
         style_hint: 回应风格提示
@@ -129,15 +193,8 @@ def retrieve_memory(query: str, relationship_with_user: str = "friend", style_hi
         - retrieved_user_knowledge: 从用户长期知识库检索的相关条目
         - retrieved_assistant_knowledge: 从助手知识库检索的相关条目
     """
-    global memoryos_instance
-    
-    if memoryos_instance is None:
-        return {
-            "status": "error",
-            "message": "MemoryOS is not initialized. Please check the configuration file."
-        }
-    
     try:
+        memoryos_instance = get_memoryos(user_id)
         if not query:
             return {
                 "status": "error",
@@ -196,26 +253,20 @@ def retrieve_memory(query: str, relationship_with_user: str = "friend", style_hi
         }
 
 @mcp.tool()
-def get_user_profile(include_knowledge: bool = True, include_assistant_knowledge: bool = False) -> Dict[str, Any]:
+def get_user_profile(user_id: str, include_knowledge: bool = True, include_assistant_knowledge: bool = False) -> Dict[str, Any]:
     """
-    获取用户的画像信息，包括个性特征、偏好和相关知识
+    获取用户的画像信息，包括个性特征、偏好和相关知识。只能读取 user_id 自己的画像。
     
     Args:
+        user_id: 记忆所属用户的标识。必须原样使用消息开头 [用户标识：…] 里的值，不得自行编造或改写
         include_knowledge: 是否包括用户相关的知识条目
         include_assistant_knowledge: 是否包括助手知识库
     
     Returns:
         包含用户画像信息的字典
     """
-    global memoryos_instance
-    
-    if memoryos_instance is None:
-        return {
-            "status": "error",
-            "message": "MemoryOS is not initialized. Please check the configuration file."
-        }
-    
     try:
+        memoryos_instance = get_memoryos(user_id)
         # 获取用户画像
         user_profile = memoryos_instance.get_user_profile_summary()
         
@@ -269,13 +320,14 @@ def main():
     
     args = parser.parse_args()
     
-    global memoryos_instance
-    
+    global _config
+
     try:
-        # 初始化MemoryOS
-        memoryos_instance = init_memoryos(args.config)
-        print(f"MemoryOS MCP Server 已启动，用户ID: {memoryos_instance.user_id}", file=sys.stderr)
+        # 只读配置；各用户的 MemoryOS 实例在第一次使用该 user_id 时按需创建
+        _config = load_config(args.config)
+        print("MemoryOS MCP Server 已启动（按 user_id 隔离记忆）", file=sys.stderr)
         print(f"配置文件: {args.config}", file=sys.stderr)
+        threading.Thread(target=_warm_embedding_model, daemon=True).start()
         
         # 启动MCP服务器 - 使用stdio传输
         mcp.run(transport="stdio")

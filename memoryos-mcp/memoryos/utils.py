@@ -4,6 +4,7 @@ import openai
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import json
+import re
 import os
 import inspect
 from functools import wraps
@@ -255,12 +256,41 @@ def gpt_generate_multi_summary(text, client: OpenAIClient, model="gpt-4o-mini"):
     ]
     print("Calling LLM to generate multi-topic summary...")
     response_text = client.chat_completion(model=model, messages=messages)
-    try:
-        summaries = json.loads(response_text)
-    except json.JSONDecodeError:
+    summaries = _parse_summary_list(response_text)
+    if not summaries:
         print(f"Warning: Could not parse multi-summary JSON: {response_text}")
-        summaries = [] # Return empty list or a default structure
     return {"input": text, "summaries": summaries}
+
+
+def _parse_summary_list(response_text):
+    """
+    宽松解析多主题摘要。DeepSeek 等模型会把 JSON 包在 ```json 代码块里，或在前后加说明文字，
+    直接 json.loads 会失败，结果每次都退回「General conversation segment」这条兜底摘要。
+    这里先去掉代码块围栏，再取第一个完整的 JSON 数组/对象；兼容 {"summaries": [...]} 的写法。
+    """
+    if not response_text:
+        return []
+    text = response_text.strip()
+    candidates = [text]
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if fence:
+        candidates.insert(0, fence.group(1).strip())
+    for open_ch, close_ch in (("[", "]"), ("{", "}")):
+        start, end = text.find(open_ch), text.rfind(close_ch)
+        if start != -1 and end > start:
+            candidates.append(text[start:end + 1])
+    for cand in candidates:
+        try:
+            data = json.loads(cand)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(data, dict):
+            data = data.get("summaries", [data] if "content" in data else [])
+        if isinstance(data, list):
+            items = [d for d in data if isinstance(d, dict) and d.get("content")]
+            if items:
+                return items
+    return []
 
 
 def gpt_user_profile_analysis(dialogs, client: OpenAIClient, model="gpt-4o-mini", existing_user_profile="None"):
