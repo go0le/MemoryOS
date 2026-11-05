@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Added by go0le (2026-11) for the 哈Gemi QQ bot. Launches the MCP server of BAI-LAB/MemoryOS
+# (https://github.com/BAI-LAB/MemoryOS, Apache-2.0) with the API key taken from .env.memoryos.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 MCP_DIR="$ROOT/memoryos-mcp"

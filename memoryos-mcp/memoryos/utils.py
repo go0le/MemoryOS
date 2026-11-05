@@ -1,3 +1,5 @@
+# Modified by go0le (2026-11) for the 哈Gemi QQ bot: see HAGEMI_CHANGES.md.
+# Original: BAI-LAB/MemoryOS (https://github.com/BAI-LAB/MemoryOS), Apache License 2.0.
 import time
 import uuid
 import openai

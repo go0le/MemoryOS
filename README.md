@@ -1,3 +1,11 @@
+> **这是 [BAI-LAB/MemoryOS](https://github.com/BAI-LAB/MemoryOS) 的分支（`hagemi`），不是原版。**
+> 基于上游提交 `587ed77`，许可证沿用 Apache License 2.0。为 QQ 机器人「哈Gemi」加了按用户隔离、摘要解析修复、启动脚本，并附上召回策略和评测脚本。
+> 改了什么、评测结果见 [`HAGEMI_CHANGES.md`](HAGEMI_CHANGES.md)。以下是上游原版的 README。
+>
+> *This is a fork of [BAI-LAB/MemoryOS](https://github.com/BAI-LAB/MemoryOS) (Apache-2.0), based on upstream `587ed77`. See [`HAGEMI_CHANGES.md`](HAGEMI_CHANGES.md) for the changes. The original README follows.*
+
+---
+
 # MemoryOS
 <div align="center">
   <img src="https://github.com/user-attachments/assets/eb3b167b-1ace-476e-89dc-1a7891356e0b" alt="logo" width="400"/>
